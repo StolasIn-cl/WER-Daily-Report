@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+cache/
+output/
+state/
+mail-config.local.json
+comments-*.json
+project-snapshot.json
+remote-report-*.json
+*.log
+.env
+.env.*

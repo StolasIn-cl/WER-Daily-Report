@@ -1,0 +1,5 @@
+{
+  "recipients_source": "C:/Users/YOUR_USER/Desktop/Nightly-PR-Report/recipients.json",
+  "extra_recipients": ["additional.recipient@example.com"],
+  "subject_prefix": "WER Daily Report"
+}
