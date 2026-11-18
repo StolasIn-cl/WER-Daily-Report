@@ -345,8 +345,120 @@ def daily_overview(rows, day):
     groups = group_rows(rows, 'daily', day)
     return dict(new=new, counts={s: sum(r.get('status') == s for r in new) for s in NEW_ORDER},
                 done_on_day=sum(done_on_day(r, day) for r in rows),
-                init_total=len(groups['Init']), handling=groups['Handling'], handled=groups['Handled'],
+                delivered=[r for r in rows if on_day(r.get('delivered_at'), day)],
+                init_total=len(groups['Init']), init_rows=groups['Init'], handling=groups['Handling'], handled=groups['Handled'],
                 missing_created=sum(instant(r.get('created_at')) is None for r in rows))
+
+
+AGING_DAYS = 3
+HISTORY_DAYS = 14
+EARLIEST = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+
+def day_metrics(rows, day):
+    ov = daily_overview(rows, day)
+    return dict(new=len(ov['new']), delivered=len(ov['delivered']), done=ov['done_on_day'], init=ov['init_total'],
+                handling=len(ov['handling']), handled=len(ov['handled']))
+
+
+def history_entry(data, day):
+    """One day's counts from a captured data.json; None when old data lacks creation times."""
+    rows = data.get('rows') or []
+    if not rows or any(instant(r.get('created_at')) is None for r in rows):
+        return None
+    return dict(date=day, captured_at=data.get('captured_at'), **day_metrics(rows, day))
+
+
+def build_history(root, data, day, persist):
+    """Daily counts for the trend charts: saved history + every dated output/*/*/data.json + this run."""
+    path = root / 'state' / 'history.json'
+    entries = {}
+    try:
+        entries = {e['date']: e for e in json.loads(path.read_text(encoding='utf-8'))['entries']}
+    except (OSError, ValueError, KeyError, TypeError):
+        entries = {}
+
+    def offer(entry):
+        if not entry:
+            return
+        old = entries.get(entry['date'])
+        if not old or (instant(entry.get('captured_at')) or EARLIEST) >= (instant(old.get('captured_at')) or EARLIEST):
+            entries[entry['date']] = entry
+
+    for file in sorted((root / 'output').glob('*/*/data.json')):
+        try:
+            dt.date.fromisoformat(file.parent.parent.name)
+            offer(history_entry(json.loads(file.read_text(encoding='utf-8-sig')), file.parent.parent.name))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    offer(history_entry(data, day))
+    result = [entries[k] for k in sorted(entries)]
+    if persist:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(dict(entries=result), ensure_ascii=False, indent=2), encoding='utf-8')
+    return result
+
+
+def oldest_init(rows, captured_at):
+    dated = [r for r in rows if instant(r.get('created_at'))]
+    if not dated:
+        return None
+    row = min(dated, key=lambda r: instant(r['created_at']))
+    days = waiting_days(dict(delivered_at=row['created_at']), captured_at)
+    return dict(row=row, days=days)
+
+
+def signed(value):
+    return f'{value:+d}' if value else '持平'
+
+
+def trend_card(title, points, bad_up=None, width=520, height=135):
+    """Compact PDF-safe sparkline card in the style of the Nightly PR report."""
+    if not points:
+        return ''
+    left, right, top, bottom = 38, 12, 12, 32
+    pw, ph = width - left - right, height - top - bottom
+    values = [v for _, v in points]
+    ceiling = max(max(values), 1)
+
+    def x(i):
+        return left + pw / 2 if len(points) == 1 else left + pw * i / (len(points) - 1)
+
+    def y(v):
+        return top + (ceiling - v) * ph / ceiling
+
+    grid = ''.join(f'<line x1="{left}" y1="{y(v):.1f}" x2="{width - right}" y2="{y(v):.1f}" stroke="#d7e0e2"/>'
+                   f'<text x="{left - 4}" y="{y(v) + 5:.1f}" text-anchor="end" font-size="14" fill="#596a72">{v:g}</text>'
+                   for v in sorted({0, round(ceiling / 2), ceiling}))
+    line = ' '.join(f'{x(i):.1f},{y(v):.1f}' for i, (_, v) in enumerate(points))
+    dots = ''.join(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="{3.5 if i == len(points) - 1 else 2.2}" '
+                   f'fill="{"#326a73" if i == len(points) - 1 else "#8caab1"}"/>' for i, (_, v) in enumerate(points))
+    ends = [0] if len(points) == 1 else [0, len(points) - 1]
+    labels = ''.join(f'<text x="{x(i):.1f}" y="{height - 8}" font-size="14" fill="#596a72" '
+                     f'text-anchor="{"start" if i == 0 else "end"}">{esc(points[i][0][5:])}</text>' for i in ends)
+    delta = ''
+    if len(points) > 1:
+        diff = values[-1] - values[-2]
+        tone = 'flat' if not diff or bad_up is None else ('bad' if (diff > 0) == bad_up else 'good')
+        delta = f'<span class="delta {tone}">較前一日 {esc(signed(diff))}</span>'
+    return (f'<div class="trend-card"><div class="trend-title">{esc(title)}</div>'
+            f'<div class="trend-value">{values[-1]}{delta}</div>'
+            f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" aria-label="{esc(title)} 近期變化">'
+            f'{grid}<line x1="{left}" y1="{top}" x2="{left}" y2="{top + ph}" stroke="#9aaab0"/>'
+            f'<polyline points="{line}" fill="none" stroke="#326a73" stroke-width="2" stroke-linejoin="round" '
+            f'stroke-linecap="round"/>{dots}{labels}</svg></div>')
+
+
+def trend_section(history, day):
+    series = [e for e in (history or []) if e.get('date') and e['date'] <= day][-HISTORY_DAYS:]
+    if not series:
+        return ''
+    specs = [('每日新增 crash', 'new', None), ('AutoFix 每日跑完', 'delivered', None)]
+    cards = ''.join(trend_card(t, [(e['date'], e[k]) for e in series if isinstance(e.get(k), int)], bad) for t, k, bad in specs)
+    return (f'<section class="overview trend"><div class="section-label">近 {len(series)} 天變化 '
+            f'<small>{esc(series[0]["date"])} ~ {esc(series[-1]["date"])}</small></div>'
+            f'<div class="trend-cards">{cards}</div>'
+            '<p class="scope-note">新增為各統計日新建立的 issue 數；AutoFix 跑完為各統計日交付結果（最新一次 run 發布報告）的案件數。</p></section>')
 
 
 def short_text(value, limit=160):
@@ -413,7 +525,7 @@ def render_table(name, title, description, labels, widths, body_rows, empty_text
     return ''.join(out)
 
 
-def render(data, view, day):
+def render(data, view, day, history=None):
     ov = daily_overview(data['rows'], day)
     handled, handling = ov['handled'], ov['handling']
     demo = data['source'].startswith('DEMO')
@@ -423,21 +535,26 @@ def render(data, view, day):
     waits = [w for w in (waiting_days(r, captured_at) for r in handled) if w is not None]
 
     def metric(label, value, detail):
-        return f'<article class="metric"><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>'
+        small = f'<small>{detail}</small>' if detail else ''
+        return f'<article class="metric"><span>{label}</span><strong>{value}</strong>{small}</article>'
 
-    yesterday = [metric('昨日新增 crash', len(ov['new']), '依 issue 建立時間計算'),
-                 metric('其中：未解', counts['Init'], '目前仍是 Init，尚未開始處理'),
-                 metric('其中：處理中', counts['Handling'], '目前 Handling'),
+    yesterday = [metric('昨日新增 crash', len(ov['new']), ''),
+                 metric('其中：未解', counts['Init'], ''),
+                 metric('其中：處理中', counts['Handling'], ''),
                  metric('其中：已解完', counts['Handled'] + counts['Done'],
                         f'待 RD 處理 {counts["Handled"]} · 已結案 {counts["Done"]}'),
-                 metric('昨日新進 Done', ov['done_on_day'], '昨日結案，只列數字')]
+                 metric('昨日新進 Done', ov['done_on_day'], ''),
+                 metric('AutoFix 昨日跑完', len(ov['delivered']), '')]
     s = summarize(handled)
     money = (f'時間不含排隊；成本含估算 {s["cost_estimated"]} 件；' if s['cost_estimated'] else '時間不含排隊；') \
         + f'缺成本 {s["cost_missing"]} 件'
-    current = [metric('目前 Init 待解', ov['init_total'], '只列數字，不列明細'),
-               metric('目前 Handling', len(handling), '處理中，明細見下方'),
-               metric('目前 Handled 等 RD', len(handled), '已交付，明細見下方'),
-               metric('最久已等待', f'{max(waits)} 天' if waits else '尚無資料', '從 AutoFix 交付到資料擷取')]
+    first_init = oldest_init(ov['init_rows'], captured_at)
+    init_note = (f'最舊建立於 {clock(first_init["row"]["created_at"])[:10]}（已等 {first_init["days"]} 天）'
+                 if first_init and first_init['days'] is not None else '')
+    current = [metric('目前 Init 待解', ov['init_total'], init_note),
+               metric('目前 Handling', len(handling), ''),
+               metric('目前 Handled 等 RD', len(handled), ''),
+               metric('最久已等待', f'{max(waits)} 天' if waits else '尚無資料', '自 AutoFix 交付起算')]
     output = ['<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
               '<title>WER AutoFix 每日報告</title><style>' + CSS + '</style></head><body><main>',
               '<header><div class="eyebrow">WER AUTOFIX / DAILY REPORT</div><h1>WER AutoFix 每日報告</h1>',
@@ -460,6 +577,8 @@ def render(data, view, day):
     cost_part = f'模型成本合計 USD {s["cost_usd"]:,.2f}' if s['count'] - s['cost_missing'] else '模型成本合計 尚無資料'
     output.append(f'</div><p class="scope-note">上列為目前 Handled 的結局分布。{esc(time_part)}、{esc(cost_part)}'
                   f'（最新 run 累計，非昨日新增消耗；{esc(money)}）。</p></section>')
+
+    output.append(trend_section(history, day))
 
     # Yesterday's new crashes: compact one-line rows; Init and Done show only a title.
     mini_labels = ['Crash / Issue', '目前狀態', 'crash 版本', '結局／備註', '接手 RD']
@@ -545,7 +664,7 @@ CSS = """
 # Readability overrides shared by screen and print.
 CSS += """
 .backlog{margin-top:22px}.case-dates{display:flex;flex-wrap:wrap;gap:5px 12px;margin-top:12px;padding:8px 10px;background:#eaf0e5;border-left:3px solid #739568;font-size:14px;line-height:1.7}.case-dates span{display:block}.case-dates b{color:#365640}.case-dates time{font-variant-numeric:tabular-nums}.subtitle{font-weight:600}
-.intake .metrics{grid-template-columns:repeat(5,minmax(0,1fr))}.intake .metric:first-child strong{color:#276447}.backlog{background:#fffefb;border-color:#d9dfd5;box-shadow:0 2px 8px #243b3205}.average{display:block;color:#365e4b;font-size:15px;font-weight:600;margin-top:3px}.average small{display:block;font-weight:400;margin-top:4px}.backlog .metric:last-child strong{font-size:24px;font-variant-numeric:tabular-nums}.metric strong{font-variant-numeric:tabular-nums}.backlog .metric>small{line-height:1.6}.backlog .metric a{font-weight:600}.intake .metric>span{line-height:1.5}
+.intake .metrics{grid-template-columns:repeat(6,minmax(0,1fr))}.intake .metric:first-child strong{color:#276447}.backlog{background:#fffefb;border-color:#d9dfd5;box-shadow:0 2px 8px #243b3205}.average{display:block;color:#365e4b;font-size:15px;font-weight:600;margin-top:3px}.average small{display:block;font-weight:400;margin-top:4px}.backlog .metric:last-child strong{font-size:24px;font-variant-numeric:tabular-nums}.metric strong{font-variant-numeric:tabular-nums}.backlog .metric>small{line-height:1.6}.backlog .metric a{font-weight:600}.intake .metric>span{line-height:1.5}
 @media(max-width:800px){.intake .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.intake .metric:first-child{grid-column:1/-1;border:0;border-bottom:1px solid #ccd6c5;padding-bottom:12px}.intake .metric:nth-child(2){border-right:1px solid #ccd6c5}.intake .metric:nth-child(3){border:0}.backlog .metric:last-child strong{font-size:21px}}
 @media print{.backlog{margin-top:12px}.case-dates{font-size:11px;margin-top:6px;padding:4px 6px;gap:2px 8px}}
 body{font-size:17px}.metadata,nav a,.section-label small,.metric small,.scope-note,.group-heading p,.links{font-size:14px}
@@ -643,6 +762,23 @@ CSS += """
 """
 
 
+# Trend cards.
+CSS += """
+.trend{margin-top:22px;background:#fffefa;border-color:var(--line)}
+.trend-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}
+.trend-card{border:1px solid #d7e0e2;border-radius:8px;background:#fafcfb;padding:10px 12px;min-width:0}
+.trend-title{font-size:16px;color:#52656e;font-weight:700}.trend-value{font-size:30px;font-weight:700;margin:2px 0 4px;font-variant-numeric:tabular-nums}
+.delta{font-size:15px;font-weight:600;margin-left:8px}.delta.bad{color:#934b46}.delta.good{color:#32694f}.delta.flat{color:var(--muted)}
+@media(max-width:800px){.trend-cards{grid-template-columns:minmax(0,1fr)}}
+@media print{
+ header{padding-bottom:6px;margin-bottom:8px}h1{font-size:20px;margin:2px 0}.subtitle{font-size:13px;margin:0 0 3px}.metadata{font-size:10px}
+ .overview{padding:10px 16px}.overview .scope-note{display:none}.section-label{font-size:17px}.section-label small{font-size:12px}.metrics{margin-top:8px;gap:12px}.overview .metric strong,.backlog .metric strong,.backlog .metric:last-child strong,.intake .metric:first-child strong{font-size:28px;margin:2px 0 2px}.metric>span{font-size:15px}.metric small{font-size:13px;line-height:1.4}
+ .outcomes{margin-top:8px;padding-top:8px}.outcome{font-size:15px}.outcome b{font-size:18px}.backlog{margin-top:8px}.average{font-size:12px}
+ .trend{margin-top:8px;break-inside:avoid}.trend-cards{gap:8px;margin-top:8px}.trend-card{padding:6px 8px}.trend-value{font-size:22px;margin:0 0 2px}.trend-title{font-size:13px}.delta{font-size:12px}
+}
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -663,9 +799,10 @@ def main():
         data = collect(args.date, Path(__file__).resolve().parent / 'cache')
     else:
         data = json.loads(args.input.read_text(encoding='utf-8-sig'))
+    history = None if args.demo else build_history(Path(__file__).resolve().parent, data, args.date, args.live)
     output = out / 'report.html'
     (out / 'data.json').write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    output.write_text(render(data, args.view, args.date), encoding='utf-8')
+    output.write_text(render(data, args.view, args.date, history), encoding='utf-8')
     if args.pdf:
         subprocess.run(['node', str(Path(__file__).with_name('render_report.cjs')), str(output.resolve())], check=True)
     counts = {name: len(rows) for name, rows in group_rows(data['rows'], args.view, args.date).items()}

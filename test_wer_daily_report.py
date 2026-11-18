@@ -269,5 +269,87 @@ class ReportTests(unittest.TestCase):
         self.assertIn('尚無版本資料', rendered)
 
 
+    def history_rows(self):
+        return [dict(number=1, status='Init', created_at='2026-11-08T01:00:00Z'),
+                dict(number=2, status='Handled', created_at='2026-10-01T00:00:00Z',
+                     delivered_at='2026-11-01T00:00:00Z', url='https://github.com/x/y/issues/2'),
+                dict(number=3, status='Done', created_at='2026-11-08T02:00:00Z', closed_at='2026-11-08T03:00:00Z')]
+
+    def test_history_entry_counts_the_day_and_rejects_data_without_creation_times(self):
+        m = self.module()
+        data = dict(captured_at='2026-11-09T08:00:00+08:00', rows=self.history_rows())
+        self.assertEqual(m.history_entry(data, '2026-11-08'),
+                         dict(date='2026-11-08', captured_at='2026-11-09T08:00:00+08:00',
+                              new=2, delivered=0, done=1, init=1, handling=0, handled=1))
+        data['rows'].append(dict(number=9, status='Init'))
+        self.assertIsNone(m.history_entry(data, '2026-11-08'))
+
+    def test_build_history_merges_saved_and_dated_outputs_and_keeps_latest_capture(self):
+        import json
+        import tempfile
+        m = self.module()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = dict(captured_at='2026-11-08T08:00:00+08:00', rows=self.history_rows())
+            for gen, captured in [('a', '2026-11-08T08:00:00+08:00'), ('b', '2026-11-08T09:00:00+08:00')]:
+                folder = root / 'output' / '2026-11-07' / gen
+                folder.mkdir(parents=True)
+                (folder / 'data.json').write_text(json.dumps(dict(old, captured_at=captured)), encoding='utf-8')
+            (root / 'output' / 'preview' / 'x').mkdir(parents=True)
+            (root / 'output' / 'preview' / 'x' / 'data.json').write_text('{}', encoding='utf-8')
+            current = dict(captured_at='2026-11-09T08:00:00+08:00', rows=self.history_rows())
+            history = m.build_history(root, current, '2026-11-08', persist=True)
+            self.assertEqual([e['date'] for e in history], ['2026-11-07', '2026-11-08'])
+            self.assertEqual(history[0]['captured_at'], '2026-11-08T09:00:00+08:00')
+            self.assertEqual(json.loads((root / 'state' / 'history.json').read_text(encoding='utf-8'))['entries'], history)
+            again = m.build_history(root, current, '2026-11-08', persist=False)
+            self.assertEqual(again, history)
+
+    def test_trend_section_has_only_new_and_autofix_finished_charts(self):
+        m = self.module()
+        history = [dict(date='2026-11-07', new=3, delivered=1, init=18),
+                   dict(date='2026-11-08', new=1, delivered=3, init=20)]
+        html = m.trend_section(history, '2026-11-08')
+        self.assertIn('每日新增 crash', html)
+        self.assertIn('AutoFix 每日跑完', html)
+        self.assertNotIn('Init 待解', html)
+        self.assertIn('較前一日 -2', html)
+        self.assertIn('較前一日 +2', html)
+        self.assertEqual(html.count('<polyline'), 2)
+        self.assertEqual(m.trend_section([], '2026-11-08'), '')
+        self.assertIn('<circle', m.trend_section(history[:1], '2026-11-08'))
+        # Old saved days without a delivered count simply have no point on that chart.
+        partial = m.trend_section([dict(date='2026-11-07', new=3), history[1]], '2026-11-08')
+        self.assertEqual(partial.count('<circle'), 3)
+
+    def test_autofix_finished_counts_runs_delivered_on_the_stat_day_by_outcome(self):
+        m = self.module()
+        rows = [dict(number=1, status='Handled', ending='fixed', delivered_at='2026-11-08T01:00:00Z', created_at='2026-10-01T00:00:00Z'),
+                dict(number=2, status='Done', ending='cannot_reproduce', delivered_at='2026-11-08T05:00:00Z', created_at='2026-10-01T00:00:00Z'),
+                dict(number=3, status='Handled', ending='fixed', delivered_at='2026-11-07T05:00:00Z', created_at='2026-10-01T00:00:00Z'),
+                dict(number=4, status='Handling', created_at='2026-10-01T00:00:00Z')]
+        self.assertEqual(len(m.daily_overview(rows, '2026-11-08')['delivered']), 2)
+        rendered = m.render(dict(captured_at='2026-11-10T08:00:00+08:00', source='test', warnings=[], rows=rows),
+                            'daily', '2026-11-08')
+        self.assertIn('AutoFix 昨日跑完', rendered)
+        self.assertNotIn('已修復 1 · 無法重現 1', rendered)
+        self.assertEqual(m.history_entry(dict(captured_at='x', rows=rows), '2026-11-08')['delivered'], 2)
+
+    def test_report_has_no_attention_block(self):
+        m = self.module()
+        data = dict(captured_at='2026-11-10T08:00:00+08:00', source='test', warnings=[], rows=self.history_rows())
+        rendered = m.render(data, 'daily', '2026-11-08', [])
+        self.assertNotIn('需要關注', rendered)
+        self.assertNotIn('class="headline"', rendered)
+
+    def test_init_overview_shows_oldest_wait_without_listing_init_rows(self):
+        m = self.module()
+        rows = [dict(number=1, status='Init', title='INIT-ONLY-COUNT', created_at='2026-11-01T00:00:00Z'),
+                dict(number=2, status='Init', title='INIT-NEWER', created_at='2026-11-05T00:00:00Z')]
+        rendered = m.render(dict(captured_at='2026-11-10T08:00:00+08:00', source='test', warnings=[], rows=rows),
+                            'daily', '2026-11-09')
+        self.assertIn('最舊建立於 2026-11-01（已等 9 天）', rendered)
+        self.assertNotIn('INIT-ONLY-COUNT', rendered)
+
 if __name__ == '__main__':
     unittest.main()
