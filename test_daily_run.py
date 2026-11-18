@@ -7,6 +7,12 @@ import daily_run as m
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_manifest_path_read_from_state_can_be_a_string(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / 'delivery-manifest.json'
+            file.write_text('{"report_date": "2026-11-11"}', encoding='utf-8')
+            self.assertEqual(m.read_json(str(file)), {'report_date': '2026-11-11'})
+
     def test_recipient_merge_is_case_insensitive_without_changing_source(self):
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / 'recipients.json'

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import uuid
 
-from wer_daily_report import TAIPEI, group_rows, intake_summary
+from wer_daily_report import TAIPEI, daily_overview
 
 SHARED = Path(__file__).resolve().parent.parent / 'Report-Delivery'
 sys.path.insert(0, str(SHARED))
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 
 
 def read_json(path):
-    return json.loads(path.read_text(encoding='utf-8-sig'))
+    return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 
 def recipients(config):
@@ -99,17 +99,22 @@ def prepare(day, state_path):
         if len(raw_pdf) < 1000 or not raw_pdf.startswith(b'%PDF-'):
             raise ValueError('Generated PDF is missing or invalid')
         pdf.write_bytes(raw_pdf)
-        counts = {name: len(rows) for name, rows in group_rows(data['rows'], 'daily', day).items()}
-        intake = intake_summary(data['rows'], day)
+        ov = daily_overview(data['rows'], day)
+        counts = dict(new=len(ov['new']), new_by_status=ov['counts'], done_on_day=ov['done_on_day'],
+                      init=ov['init_total'], handling=len(ov['handling']), handled=len(ov['handled']))
+        c = ov['counts']
         body = (f'WER AutoFix 每日報告 — {day}（台灣時間）\n\n'
-                f'新增 crash issues：{intake["total"]} 件\n'
-                + '\n'.join(f'{name}：{count} 件' for name, count in counts.items())
-                + '\n\nHandled／Handling／Init 為資料擷取當下的全部案件；Done 為統計日最後修改的案件。'
-                + f'\n資料擷取：{data["captured_at"]}\n詳情請見 PDF 附件。')
+                f'昨日新增 crash：{counts["new"]} 件（未解 {c["Init"]}、處理中 {c["Handling"]}、'
+                f'已解完待 RD {c["Handled"]}、已結案 {c["Done"]}）\n'
+                f'昨日新進 Done：{counts["done_on_day"]} 件\n'
+                f'目前 Init 待解：{counts["init"]} 件\n'
+                f'目前 Handling 處理中：{counts["handling"]} 件\n'
+                f'目前 Handled 等 RD 處理：{counts["handled"]} 件'
+                f'\n\n資料擷取：{data["captured_at"]}\n各案件明細、根因與 PR 連結請見 PDF 附件。')
         state.update(status='ready', prepared_at=now(), captured_at=data['captured_at'],
                      recipients=addresses, subject=f'{config["subject_prefix"]} — {day}', body=body,
                      pdf_path=str(pdf), pdf_sha256=hashlib.sha256(raw_pdf).hexdigest(),
-                     html_path=str(out / 'report.html'), groups=counts, new_issues=intake,
+                     html_path=str(out / 'report.html'), groups=counts, new_issues=ov['counts'],
                      warnings=data.get('warnings', []))
         manifest_path = out / 'delivery-manifest.json'
         write_json(manifest_path, delivery_manifest(state, sender))

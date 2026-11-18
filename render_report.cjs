@@ -24,13 +24,13 @@ if (!chromium) throw new Error('Set PLAYWRIGHT_MODULE to an installed Playwright
     for (const [name, width, height] of [['desktop', 1440, 1100], ['narrow', 390, 844]]) {
       await page.setViewportSize({width, height});
       await page.screenshot({path: path.join(folder, `${name}-top.png`)});
-      for (const section of ['Handled', 'Done', 'Handling', 'Init']) {
+      for (const section of ['New', 'Handling', 'Handled']) {
         await page.locator(`#${section}`).evaluate(e => scrollTo(0, e.offsetTop));
         await page.screenshot({path: path.join(folder, `${name}-${section}.png`)});
       }
       checks.push(await page.evaluate(() => ({width: innerWidth, documentWidth: document.documentElement.scrollWidth,
         sections: [...document.querySelectorAll('.group')].map(e => ({name: e.id, rows: e.querySelectorAll('.case-row').length})),
-        overflowCells: [...document.querySelectorAll('.cell')].filter(e => e.scrollWidth > e.clientWidth + 1).length})));
+        overflowCells: [...document.querySelectorAll('.cell, .mini td')].filter(e => e.scrollWidth > e.clientWidth + 1).length})));
       await page.evaluate(() => scrollTo(0, 0));
     }
     fs.writeFileSync(path.join(folder, 'browser-check.json'), JSON.stringify(checks, null, 2));

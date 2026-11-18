@@ -172,13 +172,30 @@ def boomerang_link(body, title):
             if prop else None)
 
 
+def version_info(body):
+    """Crash version rows written into the issue body by the intake (new format), with the old single-row fallback."""
+    def cell(label):
+        match = re.search(r'\|\s*' + label + r'\s*\|\s*([^|\r\n]+?)\s*\|', body or '')
+        return match.group(1).replace('`', '').strip() if match else None
+    return dict(latest_crash_at=cell('最新一次當機'), latest_crash_version=cell('最新一次當機的版本'),
+                owned_versions=cell('本票承接的版本') or cell('版本'))
+
+
 def normalize_report(report, run):
     if report.get('run_id') != run['run_id'] or report.get('bug') != run['bug']:
         raise ValueError('Published report identity does not match the run marker')
     seconds, basis = processing_time(report)
     ending = report.get('outcome') or (report.get('ending') or {}).get('name')
     full = report.get('full_report') or {}
+    ending_info = report.get('ending') or {}
+    plain = (report.get('agent_report') or {}).get('plain') if isinstance(report.get('agent_report'), dict) else None
+    plain_cause = ((plain or {}).get('root_cause') or '').strip() if isinstance(plain, dict) else ''
+    origin = ((ending_info.get('root_cause') or {}).get('bad_state_origin')) or {}
+    location = (f'{Path(str(origin["file"]).replace(chr(92), "/")).name}:{origin["line"]}'
+                if origin.get('file') and origin.get('line') else None)
     return dict(run_id=run['run_id'], delivered_at=run['delivered_at'], ending=ending,
+                root_cause=(plain_cause or origin.get('mechanism') or None), root_cause_loc=location,
+                pr_state=ending_info.get('pr') if isinstance(ending_info.get('pr'), str) else None,
                 processing_seconds=seconds, time_basis=basis,
                 cost_usd=number(report.get('estimated_cost_usd')),
                 cost_basis='estimate' if report.get('cost_includes_estimate') else 'measured',
@@ -213,6 +230,7 @@ def collect(day, cache_dir):
                    issue_updated_at=issue_timing.get('updatedAt'),
                    closed_at=issue_timing.get('closedAt'),
                    modified_at=latest_modified(timing.get('updatedAt'), issue_timing.get('updatedAt')))
+        row.update(version_info(content.get('body', '')))
         if row['status'] not in ('Handled', 'Handling', 'Init', 'Done'):
             row['warnings'].append(f'Unknown Project status: {row["status"]}')
         if row['status'] == 'Init':
@@ -248,7 +266,7 @@ def collect(day, cache_dir):
             row.update(row['run_history'][0])
         if row['status'] == 'Handling':
             # A published previous run is not progress/cost of the active run.
-            for key in ('ending', 'processing_seconds', 'cost_usd', 'delivered_at', 'run_id'):
+            for key in ('ending', 'processing_seconds', 'cost_usd', 'delivered_at', 'run_id', 'root_cause', 'root_cause_loc', 'pr_state'):
                 row[key] = None
             row['progress'] = '處理中；尚無即時進度與用量資料'
         return row
@@ -299,120 +317,212 @@ def anchor(url, label):
     return f'<a href="{esc(url)}">{esc(label)}</a>'
 
 
+STATUS_LABELS = {'Init': '未解', 'Handling': '處理中', 'Handled': '已解完・待 RD', 'Done': '已結案'}
+NEW_ORDER = ['Handled', 'Handling', 'Init', 'Done']
+
+
+def done_on_day(row, day):
+    """Done by issue close time; falls back to last modification when the issue was never closed."""
+    if row.get('status') != 'Done':
+        return False
+    if instant(row.get('closed_at')):
+        return on_day(row['closed_at'], day)
+    return on_day(row.get('modified_at'), day)
+
+
+def waiting_days(row, captured_at):
+    delivered, captured = instant(row.get('delivered_at')), instant(captured_at)
+    if not delivered or not captured:
+        return None
+    return max(0, (captured - delivered).days)
+
+
+def daily_overview(rows, day):
+    """Everything the top of the report needs: yesterday's intake, plus the current work queues."""
+    new = [r for r in rows if on_day(r.get('created_at'), day)]
+    new.sort(key=lambda r: (NEW_ORDER.index(r['status']) if r.get('status') in NEW_ORDER else len(NEW_ORDER),
+                            r.get('number', 0)))
+    groups = group_rows(rows, 'daily', day)
+    return dict(new=new, counts={s: sum(r.get('status') == s for r in new) for s in NEW_ORDER},
+                done_on_day=sum(done_on_day(r, day) for r in rows),
+                init_total=len(groups['Init']), handling=groups['Handling'], handled=groups['Handled'],
+                missing_created=sum(instant(r.get('created_at')) is None for r in rows))
+
+
+def short_text(value, limit=160):
+    value = re.sub(r'\s+', ' ', value or '').strip()
+    return value if len(value) <= limit else value[:limit - 1] + '…'
+
+
+def clock(value):
+    stamp = instant(value)
+    return stamp.astimezone(TAIPEI).strftime('%Y-%m-%d %H:%M') if stamp else '尚無資料'
+
+
+def case_links(row):
+    links = [anchor(row.get('url'), '#' + str(row.get('number', '')))]
+    links.append(anchor(row['boomerang_url'], 'Boomerang') if row.get('boomerang_url')
+                 else '<span class="missing-link">Boomerang（缺 PropID）</span>')
+    for key, label in [('report_url', '完整報告'), ('report_json_url', '報告 JSON')]:
+        if row.get(key):
+            links.append(anchor(row[key], label))
+    return ' · '.join(links)
+
+
+def version_cell(row):
+    version = row.get('latest_crash_version')
+    owned = row.get('owned_versions')
+    if not version and not owned:
+        return '<span class="missing-link">尚無版本資料</span>'
+    lines = [f'<b>{esc(version or owned)}</b>']
+    if version:
+        when = re.sub('（.*?）', '', row.get('latest_crash_at') or '').strip() or '時間未知'
+        lines.append(f'<small>最新當機 {esc(when)}</small>')
+    else:
+        lines.append('<small>承接版本，無最新當機資料</small>')
+    if version and owned and not owned.startswith(version):
+        lines.append(f'<small>本票承接 {esc(owned)}</small>')
+    return ''.join(lines)
+
+
+def pr_cell(row):
+    urls = row.get('pr_urls') or []
+    if not urls:
+        return '尚無 PR'
+    state = {'draft': 'Draft', 'ready': 'Ready'}.get(row.get('pr_state'))
+    items = [anchor(u, 'PR #' + u.rstrip('/').rsplit('/', 1)[-1]) for u in urls]
+    return '<br>'.join(items) + (f'<small>{esc(state)}</small>' if state else '')
+
+
+def render_table(name, title, description, labels, widths, body_rows, empty_text):
+    head = (f'<tr class="print-group-title"><th colspan="{len(labels)}"><h2>{esc(title)}'
+            f'<span class="count">{len(body_rows)}</span></h2><p>{esc(description)}</p></th></tr>')
+    out = [f'<section class="group" id="{name}"><div class="group-heading"><div><h2>{esc(title)}'
+           f'<span class="count">{len(body_rows)}</span></h2><p>{esc(description)}</p></div></div>',
+           '<table class="rows"><colgroup>' + ''.join(f'<col style="width:{w}%">' for w in widths)
+           + '</colgroup><thead>' + head + '<tr class="row column-head">'
+           + ''.join(f'<th>{x}</th>' for x in labels) + '</tr></thead><tbody>']
+    if not body_rows:
+        out.append(f'<tr><td colspan="{len(labels)}" class="empty">{esc(empty_text)}</td></tr>')
+    for index, cells in enumerate(body_rows, 1):
+        number_badge = f'<span class="case-number" aria-label="案例 {index}">{index}</span>'
+        cells = [number_badge + cells[0]] + cells[1:]
+        out.append('<tr class="row case-row">' + ''.join(
+            f'<td class="cell" data-label="{labels[i]}">{c}</td>' for i, c in enumerate(cells)) + '</tr>')
+    out.append('</tbody></table></section>')
+    return ''.join(out)
+
+
 def render(data, view, day):
-    groups = group_rows(data['rows'], view, day)
-    summary = summarize(groups['Handled'])
+    ov = daily_overview(data['rows'], day)
+    handled, handling = ov['handled'], ov['handling']
     demo = data['source'].startswith('DEMO')
-    scope = f'統計日 {day}（台灣時間）' if view == 'daily' else '目前看板快照'
-    completed_note = '全部已交付案件，不限日期；按最新 run 交付時間由早到晚排列，請 RD 優先檢視積壓案件。'
-    s = summary
-    subtitle = '目前全部 Handled 的最新 run 合計'
-    money_note = ('含估算 ' + str(s['cost_estimated']) + ' 件；' if s['cost_estimated'] else '') + f'缺成本 {s["cost_missing"]} 件'
-    time_count = s['count'] - s['time_missing']
-    cost_count = s['count'] - s['cost_missing']
-    time_average = f'平均每案 {duration(s["average_seconds"])}' if time_count else '平均每案 尚無資料'
-    cost_average = f'平均每案 USD {s["average_cost_usd"]:,.2f}' if cost_count else '平均每案 尚無資料'
-    time_average += f'<small>依 {time_count}／{s["count"]} 件計算</small>'
-    cost_average += f'<small>依 {cost_count}／{s["count"]} 件計算</small>'
-    dated = [r for r in groups['Handled'] if instant(r.get('delivered_at'))]
-    oldest = dated[0] if dated else None
-    oldest_date = instant(oldest['delivered_at']).astimezone(TAIPEI).strftime('%Y-%m-%d') if oldest else '尚無資料'
-    oldest_detail = (anchor(oldest.get('url'), '#' + str(oldest.get('number'))) +
-                     f' · {instant(oldest["delivered_at"]).astimezone(TAIPEI).strftime("%H:%M")} 交付'
-                     if oldest else '目前沒有可用的交付時間')
-    if len(dated) != s['count']:
-        oldest_detail += f' · 依有交付時間 {len(dated)}／{s["count"]} 件'
-    metrics = [('Handled 案件', str(s['count']), f'Done {len(groups["Done"])} · Handling {len(groups["Handling"])} · Init {len(groups["Init"])}'),
-               ('處理時間合計', duration(s['seconds']) if time_count else '尚無資料', f'<span class="average">{time_average}</span>'),
-               ('模型成本合計', f'USD {s["cost_usd"]:,.2f}' if cost_count else '尚無資料', f'<span class="average">{cost_average}</span><small>{money_note}</small>'),
-               ('目前 Handled 最早交付', oldest_date, oldest_detail)]
-    intake = intake_summary(data['rows'], day)
-    new_metrics = [('新增 crash issues', intake['total'], '依 issue 建立時間計算'),
-                   ('新增案件，目前 Init', intake['counts']['Init'], '尚待開始處理'),
-                   ('新增案件，目前 Handling', intake['counts']['Handling'], '目前處理中'),
-                   ('新增案件，目前 Handled', intake['counts']['Handled'], '已交付，待 RD 檢視'),
-                   ('新增案件，目前 Done', intake['counts']['Done'], '目前已結案')]
+    captured_at = data.get('captured_at')
+    scope = f'統計日 {day}（台灣時間）' if view == 'daily' else f'統計日 {day}（台灣時間）· 目前看板快照'
+    counts = ov['counts']
+    waits = [w for w in (waiting_days(r, captured_at) for r in handled) if w is not None]
+
+    def metric(label, value, detail):
+        return f'<article class="metric"><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>'
+
+    yesterday = [metric('昨日新增 crash', len(ov['new']), '依 issue 建立時間計算'),
+                 metric('其中：未解', counts['Init'], '目前仍是 Init，尚未開始處理'),
+                 metric('其中：處理中', counts['Handling'], '目前 Handling'),
+                 metric('其中：已解完', counts['Handled'] + counts['Done'],
+                        f'待 RD 處理 {counts["Handled"]} · 已結案 {counts["Done"]}'),
+                 metric('昨日新進 Done', ov['done_on_day'], '昨日結案，只列數字')]
+    s = summarize(handled)
+    money = (f'時間不含排隊；成本含估算 {s["cost_estimated"]} 件；' if s['cost_estimated'] else '時間不含排隊；') \
+        + f'缺成本 {s["cost_missing"]} 件'
+    current = [metric('目前 Init 待解', ov['init_total'], '只列數字，不列明細'),
+               metric('目前 Handling', len(handling), '處理中，明細見下方'),
+               metric('目前 Handled 等 RD', len(handled), '已交付，明細見下方'),
+               metric('最久已等待', f'{max(waits)} 天' if waits else '尚無資料', '從 AutoFix 交付到資料擷取')]
     output = ['<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
               '<title>WER AutoFix 每日報告</title><style>' + CSS + '</style></head><body><main>',
               '<header><div class="eyebrow">WER AUTOFIX / DAILY REPORT</div><h1>WER AutoFix 每日報告</h1>',
-              f'<p class="subtitle">{esc(scope)}</p><div class="metadata"><span>資料擷取 {esc(data.get("captured_at"))}</span>{"<span>版型示意・非實際案件</span>" if demo else ""}</div></header>',
-              '<nav><a href="#Handled">Handled</a><a href="#Done">Done</a><a href="#Handling">Handling</a><a href="#Init">Init</a></nav>',
-              f'<section class="overview intake"><div class="section-label">新增案件統計 <small>{esc(day)} · 台灣時間</small></div><div class="metrics">']
-    for label, value, detail in new_metrics:
-        output.append(f'<article class="metric"><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>')
-    output.append('</div><p class="scope-note">依統計日新建的 issue 計算，按目前狀態分類；不是當日進入該狀態的次數。以 issue 數代表 crash 案件數，非 crash 發生次數。</p>')
-    if intake['missing']:
-        output.append(f'<p class="scope-note">{intake["missing"]} 件缺建立時間，未計入；請用 --live 更新資料。</p>')
-    output.append(f'</section><section class="overview backlog"><div class="section-label">待檢視成果統計 <small>{esc(subtitle)}</small></div><div class="metrics">')
-    for label, value, detail in metrics:
-        output.append(f'<article class="metric"><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>')
-    output.append('</div><div class="outcomes">')
-    counts = {}
-    for row in groups['Handled']:
-        ending = row.get('ending') or 'unknown'
-        counts[ending] = counts.get(ending, 0) + 1
-    for ending, count in sorted(counts.items(), key=lambda p: -p[1]):
+              f'<p class="subtitle">{esc(scope)}</p><div class="metadata"><span>資料擷取 {esc(captured_at)}</span>{"<span>版型示意・非實際案件</span>" if demo else ""}</div></header>',
+              '<nav><a href="#New">昨日新增</a><a href="#Handling">處理中</a><a href="#Handled">等 RD 處理</a></nav>',
+              f'<section class="overview intake"><div class="section-label">昨日概況 <small>{esc(day)} · 台灣時間</small></div><div class="metrics">'
+              + ''.join(yesterday) + '</div><p class="scope-note">新增數依 issue 建立時間，狀態為資料擷取當下的狀態，不是昨日當天的狀態。'
+              '以 issue 數代表 crash 案件數，非 crash 發生次數。「新進 Done」以 issue 關閉時間判斷，無關閉時間才用最後修改時間。</p>']
+    if ov['missing_created']:
+        output.append(f'<p class="scope-note">{ov["missing_created"]} 件缺建立時間，未計入新增；請用 --live 更新資料。</p>')
+    output.append('</section><section class="overview backlog"><div class="section-label">目前概況 <small>資料擷取當下的全部案件</small></div>'
+                  '<div class="metrics">' + ''.join(current) + '</div><div class="outcomes">')
+    outcome_counts = {}
+    for row in handled:
+        key = row.get('ending') or 'unknown'
+        outcome_counts[key] = outcome_counts.get(key, 0) + 1
+    for ending, count in sorted(outcome_counts.items(), key=lambda p: -p[1]):
         output.append(f'<span class="outcome"><i class="dot {esc(ending)}"></i>{esc(ENDINGS.get(ending, "結局缺資料"))}<b>{count}</b></span>')
-    output.append('</div><p class="scope-note">時間與成本是目前 Handled 所列 run 的累計，非統計日新增消耗；時間不含排隊。成本為來源回報／估算，不代表訂閱帳單。</p></section>')
-    done_note = (f'{day}（台灣時間）最後修改且目前為 Done 的案件；包含手動移動狀態。' if view == 'daily' else '目前看板已結案的全部案件。') + '依原始結局判讀，不代表全部已修復；不列入上方 Handled 統計。'
-    descriptions = {'Handled': completed_note, 'Done': done_note, 'Handling': '全部目前處理中的案件，不限日期；包含等待額度或環境恢復，消耗尚未結算。',
-                    'Init': '全部等待開始處理的案件，不限日期。'}
-    labels = ['Crash / Issue', '處理結局／進度', '接手 RD', '執行機器', '處理時間', '模型成本']
-    for name, rows in groups.items():
-        case_number = 0
-        output.append(f'<section class="group" id="{name}"><div class="group-heading"><div><h2>{name}<span class="count">{len(rows)}</span></h2><p>{esc(descriptions[name])}</p></div></div>')
-        print_title = (f'<tr class="print-group-title"><th colspan="6"><h2>{name}'
-                       f'<span class="count">{len(rows)}</span></h2><p>{esc(descriptions[name])}</p></th></tr>')
-        output.append('<table class="rows"><colgroup>' + ''.join(f'<col style="width:{w}%">' for w in [35,15,13,14,12,11]) + '</colgroup><thead>' + print_title + '<tr class="row column-head">' + ''.join(f'<th>{x}</th>' for x in labels) + '</tr></thead><tbody>')
-        if not rows:
-            output.append('<tr><td colspan="6" class="empty">此區目前沒有案件</td></tr>')
-        for row in rows:
-            case_number += 1
-            title = anchor(row.get('url'), row.get('title', '未命名 crash'))
-            links = [anchor(row.get('url'), '#' + str(row.get('number', '')))]
-            links.append(anchor(row['boomerang_url'], 'Boomerang') if row.get('boomerang_url')
-                         else '<span class="missing-link">Boomerang（缺 PropID）</span>')
-            for i, url in enumerate(row.get('pr_urls') or []):
-                links.append(anchor(url, f'PR {i+1}'))
-            for key, label in [('report_url', '完整報告'), ('report_json_url', '報告 JSON')]:
-                if row.get(key):
-                    links.append(anchor(row[key], label))
-            line = row.get('ending') or 'unknown'
-            if name == 'Init':
-                ending, time_text, cost_text = '尚未執行', '—', '—'
-            elif name == 'Handling':
-                ending = row.get('progress') or '處理中；即時進度尚無資料'
-                time_text = duration(row.get('processing_seconds'))
-                cost_text = f'USD {row["cost_usd"]:,.2f}' if number(row.get('cost_usd')) is not None else '尚無資料'
-            else:
-                ending = ENDINGS.get(line, '尚無 AutoFix 結果' if line == 'unknown' else f'結局待確認（{line}）')
-                time_text = duration(row.get('processing_seconds'))
-                cost_text = f'USD {row["cost_usd"]:,.2f}' if number(row.get('cost_usd')) is not None else '尚無資料'
-            details = []
-            if name in ('Handled', 'Done'):
-                details.append(line)
-                if row.get('daily_runs', 1) > 1:
-                    details.append(f'當日 {row["daily_runs"]} 次 run，顯示最後結局')
-                if row.get('status') == 'Done':
-                    details.append('目前狀態 Done')
-            owner = '、'.join(row.get('assignees') or []) or '尚未交接'
-            worker = row.get('worker') or '尚未分派'
-            dates = []
-            for key, label in [('created_at', '新增'), ('modified_at', '修改')]:
-                stamp = instant(row.get(key))
-                value = stamp.astimezone(TAIPEI).strftime('%Y-%m-%d %H:%M') if stamp else '尚無資料'
-                dates.append(f'<span><b>{label}</b> <time>{esc(value)}</time></span>')
-            when = '<div class="case-dates">' + ''.join(dates) + '</div>'
-            estimate = '<small>含估算</small>' if row.get('cost_basis') == 'estimate' else ''
-            pending = '<small>尚未結算</small>' if name == 'Handling' else ''
-            cells = [f'<span class="case-number" aria-label="案例 {case_number}">{case_number}</span><strong class="crash-title">{title}</strong><div class="links">' + ' · '.join(links) + f'</div>{when}',
-                     f'<span class="ending {esc(line)}">{esc(ending)}</span><small>{esc(" · ".join(details))}</small>',
-                     esc(owner), esc(worker), f'<b>{esc(time_text)}</b>{pending}', f'<b>{esc(cost_text)}</b>{estimate}{pending}']
-            output.append('<tr class="row case-row">' + ''.join(f'<td class="cell" data-label="{labels[i]}">{c}</td>' for i, c in enumerate(cells)) + '</tr>')
-        output.append('</tbody></table></section>')
-    notes = ['修改時間取 GitHub issue 與 Project 項目 updatedAt 較新者；編輯內容或其他欄位也會計入，不是精確的狀態轉換時間。',
-             '新增統計依 issue createdAt 計算，狀態為擷取當下狀態。Handled／Handling／Init 顯示全部；Done 依統計日最後修改時間篩選。所有日期均為台灣時間。',
-             'Handled 代表已交付，修復是否成立依結局判讀。', data.get('note', '')]
+    time_part = f'處理時間合計 {duration(s["seconds"])}' if s['count'] - s['time_missing'] else '處理時間合計 尚無資料'
+    cost_part = f'模型成本合計 USD {s["cost_usd"]:,.2f}' if s['count'] - s['cost_missing'] else '模型成本合計 尚無資料'
+    output.append(f'</div><p class="scope-note">上列為目前 Handled 的結局分布。{esc(time_part)}、{esc(cost_part)}'
+                  f'（最新 run 累計，非昨日新增消耗；{esc(money)}）。</p></section>')
+
+    # Yesterday's new crashes: compact one-line rows; Init and Done show only a title.
+    mini_labels = ['Crash / Issue', '目前狀態', 'crash 版本', '結局／備註', '接手 RD']
+    output.append(f'<section class="listing" id="New"><div class="group-heading"><div><h2>昨日新增 crash<span class="count">{len(ov["new"])}</span></h2>'
+                  f'<p>{esc(day)} 新建立的 issue 與其目前狀態；Init 與 Done 只列標題，不展開細節。</p></div></div>'
+                  '<table class="mini"><colgroup>' + ''.join(f'<col style="width:{w}%">' for w in [36, 14, 18, 18, 14])
+                  + '</colgroup><thead><tr>' + ''.join(f'<th>{x}</th>' for x in mini_labels) + '</tr></thead><tbody>')
+    if not ov['new']:
+        output.append('<tr><td colspan="5" class="empty">昨日沒有新增 crash</td></tr>')
+    for index, row in enumerate(ov['new'], 1):
+        status = row.get('status')
+        if status == 'Handled':
+            note = ENDINGS.get(row.get('ending'), '尚無 AutoFix 結果')
+        elif status == 'Handling':
+            note = row.get('progress') or '處理中；即時進度尚無資料'
+        elif status == 'Init':
+            note = '尚未執行'
+        else:
+            note = '—'
+        label = STATUS_LABELS.get(status, f'未知狀態（{status}）')
+        cells = [f'<span class="case-number">{index}</span><strong class="crash-title">{anchor(row.get("url"), row.get("title", "未命名 crash"))}</strong>'
+                 f'<div class="links">{case_links(row) if status in ("Handled", "Handling") else ""}</div>',
+                 f'<span class="status {esc(status)}">{esc(label)}</span>', version_cell(row), esc(note),
+                 esc('、'.join(row.get('assignees') or []) or '—')]
+        output.append('<tr>' + ''.join(f'<td data-label="{mini_labels[i]}">{c}</td>' for i, c in enumerate(cells)) + '</tr>')
+    output.append('</tbody></table></section>')
+
+    handling_rows = []
+    for row in handling:
+        handling_rows.append([
+            f'<strong class="crash-title">{anchor(row.get("url"), row.get("title", "未命名 crash"))}</strong><div class="links">{case_links(row)}</div>',
+            f'<span class="ending">{esc(row.get("progress") or "處理中；即時進度尚無資料")}</span>', version_cell(row),
+            esc('、'.join(row.get('assignees') or []) or '尚未交接'), esc(row.get('worker') or '尚未分派'),
+            f'<time>{esc(clock(row.get("created_at")))}</time>', f'<time>{esc(clock(row.get("modified_at")))}</time>'])
+    output.append(render_table('Handling', '目前處理中（Handling）', '全部目前處理中的案件，不限日期；包含等待額度或環境恢復。',
+                               ['Crash / Issue', '目前進度', 'crash 版本', '接手 RD', '執行機器', '新增時間', '最後更新'],
+                               [28, 17, 13, 10, 12, 10, 10], handling_rows, '目前沒有處理中的案件'))
+
+    handled_rows = []
+    for row in handled:
+        line = row.get('ending') or 'unknown'
+        days = waiting_days(row, captured_at)
+        if days is None:
+            wait = '尚無交付時間'
+        else:
+            wait = f'<span class="{"aging" if days >= 3 else ""}">已等 {days} 天</span><small>交付 {esc(clock(row.get("delivered_at")))}</small>'
+        cause = row.get('root_cause')
+        cause_cell = (f'<span title="{esc(cause)}">{esc(short_text(cause))}</span>'
+                      + (f'<small>{esc(row["root_cause_loc"])}</small>' if row.get('root_cause_loc') else '')) if cause else '報告未提供根因'
+        handled_rows.append([
+            f'<strong class="crash-title">{anchor(row.get("url"), row.get("title", "未命名 crash"))}</strong><div class="links">{case_links(row)}</div>',
+            f'<span class="ending {esc(line)}">{esc(ENDINGS.get(line, "尚無 AutoFix 結果" if line == "unknown" else f"結局待確認（{line}）"))}</span>',
+            cause_cell, version_cell(row), f'<b>{esc(duration(row.get("processing_seconds")))}</b>',
+            esc('、'.join(row.get('assignees') or []) or '尚未交接'), wait, pr_cell(row)])
+    output.append(render_table('Handled', '目前等 RD 處理（Handled）',
+                               '全部已交付、尚待 RD 處理的案件，不限日期；等最久的排最前面。',
+                               ['Crash / Issue', '處理結局', '為什麼當', 'crash 版本', '處理時間', '接手 RD', '等待 RD 處理', '修復 PR'],
+                               [21, 10, 20, 11, 8, 9, 11, 10], handled_rows, '目前沒有等 RD 處理的案件'))
+
+    notes = ['昨日新增依 issue createdAt 計算，狀態為擷取當下狀態。Handling／Handled 顯示全部案件；Init 與 Done 只顯示數字。所有日期均為台灣時間。',
+             '「昨日新進 Done」以 issue closedAt 判斷，無 closedAt 才用 Project／issue 最後修改時間；修改時間包含內容與欄位編輯，是近似值，不是精確的狀態轉換時間。',
+             'crash 版本取自 issue 內的版本表：「最新一次當機」為 Boomerang 上該 PropID 最新一筆的時間與版本，「本票承接」為 AutoFix 承接的 package 版本；舊格式 issue 只有承接版本。', 'Handled 代表 AutoFix 已交付，修復是否成立依結局判讀；「為什麼當」取自 AutoFix 報告的白話根因（agent_report.plain.root_cause），報告沒有時退回 bad_state_origin 說明；細節請看「完整報告」。',
+             data.get('note', '')]
     output.append('<footer><h3>資料口徑</h3><ul>' + ''.join(f'<li>{esc(t)}</li>' for t in notes if t) + '</ul>')
     if data.get('warnings'):
         output.append('<details open><summary>資料缺漏 ' + str(len(data['warnings'])) + ' 項</summary><ul>' + ''.join('<li>' + esc(w) + '</li>' for w in data['warnings']) + '</ul></details>')
@@ -495,6 +605,40 @@ CSS += """
  .print-group-title p{font-size:12px;line-height:1.7;margin:7px 0 0;color:var(--muted);font-weight:400}
  .rows thead{break-inside:avoid}
  .case-number{min-width:24px;height:24px;padding:0 6px;font-size:12px;margin-right:8px}
+}
+"""
+
+
+# Layout v2: yesterday's intake and the two RD work queues come first.
+CSS += """
+.status{display:inline-block;font-size:14px;font-weight:700;padding:2px 11px;border-radius:20px;white-space:nowrap}
+.status.Init{background:#f4e6e3;color:#8a443d}.status.Handling{background:#f6ecd5;color:#7a5a1e}.status.Handled{background:#dcebe3;color:#2d6249}.status.Done{background:#e6eaec;color:#52646d}
+.aging{color:#934b46;font-weight:700}
+.listing{margin-top:34px;scroll-margin-top:15px}.listing .group-heading h2{font-size:24px;line-height:1.4;margin:0}.listing .group-heading p{color:var(--muted);margin:5px 0 14px}
+.mini{width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0;background:#fafcfb;border:1px solid #cfdcdf;border-radius:12px;overflow:hidden;text-align:left}
+.mini th{font-size:14px;font-weight:400;color:#52646d;background:#edf1f2;padding:11px 16px}
+.mini td{padding:12px 16px;border-top:1px solid #dde7e9;font-size:15px;vertical-align:top;overflow-wrap:anywhere}
+.mini small{display:block;color:var(--muted);font-size:13px;margin-top:4px;line-height:1.6}.mini .crash-title{font-size:15px;line-height:1.7}.mini .links{margin-top:4px}
+.mini .case-number{min-width:26px;height:26px;margin-bottom:0}
+.ending{display:block}
+#Handling,#Handled{margin-top:34px}
+@media(min-width:801px){
+ #Handled .row{grid-template-columns:minmax(0,2.5fr) minmax(0,1.1fr) minmax(0,2.3fr) minmax(0,1.3fr) minmax(0,.9fr) minmax(0,1fr) minmax(0,1.2fr) minmax(0,1.1fr)}
+ #Handling .row{grid-template-columns:minmax(0,2.8fr) minmax(0,1.7fr) minmax(0,1.3fr) minmax(0,1fr) minmax(0,1.2fr) minmax(0,1fr) minmax(0,1fr)}
+}
+@media(max-width:800px){
+ .mini thead{display:none}.mini,.mini tbody{display:block}
+ .mini tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;padding:16px;border-top:1px solid #dde7e9}
+ .mini tr:first-child{border-top:0}.mini td{display:block;padding:0;border:0}.mini td:first-child{grid-column:1/-1}
+ .mini td:before{content:attr(data-label);display:block;font-size:12px;color:var(--muted);margin-bottom:2px}.mini td:first-child:before{display:none}
+ .intake .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media print{
+ .listing{break-before:page;margin-top:0}.listing .group-heading{break-after:avoid}.listing .group-heading h2{font-size:22px}.listing .group-heading p{font-size:12px}
+ .mini{break-inside:auto;border-radius:0;border:0;background:transparent}.mini thead{display:table-header-group}
+ .mini tr{break-inside:avoid}.mini th{font-size:11px;padding:8px 10px}.mini td{font-size:12px;padding:8px 10px}.mini .crash-title{font-size:12px}
+ .mini .links{font-size:10px}.status{font-size:11px;padding:1px 8px}
+ .group,#Handling,#Handled{break-before:page;margin-top:0}
 }
 """
 

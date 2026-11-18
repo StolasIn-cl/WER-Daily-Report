@@ -145,19 +145,128 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('做對了', rendered)
         self.assertIn('處理時間', rendered)
 
-    def test_empty_day_still_has_three_sections(self):
+    def test_empty_day_still_has_all_sections(self):
         m = self.module()
         rendered = m.render({'rows': [], 'captured_at': '2026-11-10T08:00:00+08:00',
                              'source': 'test', 'warnings': []}, 'daily', '2026-11-09')
-        for name in ['Handled', 'Done', 'Handling', 'Init']:
+        for name in ['New', 'Handling', 'Handled']:
             self.assertIn('id="' + name + '"', rendered)
+        for name in ['Done', 'Init']:
+            self.assertNotIn('id="' + name + '"', rendered)
 
     def test_pdf_tables_have_repeating_semantic_headers(self):
         m = self.module()
         rendered = m.render(m.demo_data(), 'snapshot', '2026-11-09')
-        self.assertEqual(rendered.count('<thead>'), 4)
-        self.assertEqual(rendered.count('<tbody>'), 4)
-        self.assertEqual(rendered.count('<tr class="print-group-title">'), 4)
+        self.assertEqual(rendered.count('<thead>'), 3)
+        self.assertEqual(rendered.count('<tbody>'), 3)
+        self.assertEqual(rendered.count('<tr class="print-group-title">'), 2)
+
+    def rows_for_overview(self):
+        return [dict(number=1, status='Init', created_at='2026-11-09T01:00:00Z'),
+                dict(number=2, status='Handling', created_at='2026-11-09T02:00:00Z'),
+                dict(number=3, status='Handled', created_at='2026-11-09T03:00:00Z', ending='fixed',
+                     delivered_at='2026-11-08T00:00:00Z'),
+                dict(number=4, status='Done', created_at='2026-11-09T04:00:00Z',
+                     closed_at='2026-11-09T05:00:00Z', modified_at='2026-11-09T05:00:00Z'),
+                dict(number=5, status='Done', created_at='2026-10-01T00:00:00Z',
+                     closed_at='2026-11-09T06:00:00Z'),
+                dict(number=6, status='Done', created_at='2026-10-01T00:00:00Z',
+                     closed_at='2026-10-02T00:00:00Z', modified_at='2026-11-09T06:00:00Z'),
+                dict(number=7, status='Done', created_at='2026-10-01T00:00:00Z', modified_at='2026-11-09T07:00:00Z'),
+                dict(number=8, status='Init', created_at='2026-10-01T00:00:00Z'),
+                dict(number=9, status='Handled', created_at='2026-10-01T00:00:00Z',
+                     delivered_at='2026-10-20T00:00:00Z')]
+
+    def test_overview_counts_yesterday_intake_and_current_queues(self):
+        m = self.module()
+        ov = m.daily_overview(self.rows_for_overview(), '2026-11-09')
+        self.assertEqual([r['number'] for r in ov['new']], [3, 2, 1, 4])
+        self.assertEqual(ov['counts'], dict(Handled=1, Handling=1, Init=1, Done=1))
+        self.assertEqual(ov['init_total'], 2)
+        self.assertEqual([r['number'] for r in ov['handling']], [2])
+        self.assertEqual([r['number'] for r in ov['handled']], [9, 3])
+
+    def test_done_on_day_uses_close_time_before_modification_time(self):
+        m = self.module()
+        ov = m.daily_overview(self.rows_for_overview(), '2026-11-09')
+        # 4 and 5 closed that day; 6 only edited; 7 has no close time so modification time is used.
+        self.assertEqual(ov['done_on_day'], 3)
+
+    def test_waiting_days_is_counted_to_capture_time(self):
+        m = self.module()
+        row = dict(delivered_at='2026-11-01T00:00:00Z')
+        self.assertEqual(m.waiting_days(row, '2026-11-04T09:00:00+08:00'), 3)
+        self.assertIsNone(m.waiting_days({}, '2026-11-04T09:00:00+08:00'))
+        self.assertEqual(m.waiting_days(row, '2026-10-01T00:00:00Z'), 0)
+
+    def test_report_front_shows_numbers_only_for_init_and_done_details(self):
+        m = self.module()
+        data = dict(captured_at='2026-11-10T08:00:00+08:00', source='test', warnings=[],
+                    rows=self.rows_for_overview() + [dict(number=10, status='Init', title='ONLY-IN-COUNT-INIT',
+                                                          created_at='2026-10-01T00:00:00Z'),
+                                                     dict(number=11, status='Done', title='ONLY-IN-COUNT-DONE',
+                                                          created_at='2026-10-01T00:00:00Z',
+                                                          closed_at='2026-11-09T08:00:00Z')])
+        rendered = m.render(data, 'daily', '2026-11-09')
+        for label in ['昨日新增 crash', '昨日新進 Done', '目前 Init 待解', '目前 Handling', '目前 Handled 等 RD']:
+            self.assertIn(label, rendered)
+        self.assertNotIn('ONLY-IN-COUNT-INIT', rendered)
+        self.assertNotIn('ONLY-IN-COUNT-DONE', rendered)
+        self.assertLess(rendered.index('id="New"'), rendered.index('id="Handling"'))
+        self.assertLess(rendered.index('id="Handling"'), rendered.index('id="Handled"'))
+
+    def test_handled_row_shows_root_cause_pr_and_waiting_so_rd_need_not_open_boomerang(self):
+        m = self.module()
+        data = dict(captured_at='2026-11-10T08:00:00+08:00', source='test', warnings=[], rows=[
+            dict(number=1, title='T', url='https://github.com/x/y/issues/1', status='Handled', ending='fixed',
+                 created_at='2026-11-09T01:00:00Z', delivered_at='2026-11-05T00:00:00Z', assignees=['rd1'],
+                 root_cause='savePiPToBuffer 失敗時回傳空字串', root_cause_loc='adaptor.dart:192', processing_seconds=5520,
+                 pr_urls=['https://github.com/x/y/pull/6340'], pr_state='draft')])
+        rendered = m.render(data, 'daily', '2026-11-09')
+        for text in ['savePiPToBuffer 失敗時回傳空字串', 'adaptor.dart:192', 'PR #6340', 'Draft', '已等 5 天', 'rd1', '處理時間', '1 小時 32 分']:
+            self.assertIn(text, rendered)
+
+    def test_normalized_report_keeps_one_line_root_cause_and_pr_state(self):
+        m = self.module()
+        run = dict(run_id='r', bug='WER-1', delivered_at='2026-11-09T00:00:00Z')
+        report = dict(run_id='r', bug='WER-1', outcome='fixed', timelines=[{'total_seconds': 1}],
+                      ending=dict(name='fixed', pr='ready', root_cause=dict(
+                          bad_state_origin=dict(file=r'lib\a\b.dart', line=7, mechanism='boom'))))
+        row = m.normalize_report(report, run)
+        self.assertEqual((row['root_cause'], row['root_cause_loc'], row['pr_state']), ('boom', 'b.dart:7', 'ready'))
+        report['agent_report'] = dict(plain=dict(root_cause='傳給 SIMBA 的 script 大小比實際 buffer 長'))
+        plain = m.normalize_report(report, run)
+        self.assertEqual((plain['root_cause'], plain['root_cause_loc']), ('傳給 SIMBA 的 script 大小比實際 buffer 長', 'b.dart:7'))
+        bare = m.normalize_report(dict(run_id='r', bug='WER-1', outcome='fixed'), run)
+        self.assertIsNone(bare['root_cause'])
+        self.assertIsNone(bare['pr_state'])
+
+
+    def test_version_table_in_issue_body_is_parsed_for_latest_and_owned_versions(self):
+        m = self.module()
+        body = ('| 版本 | |\r\n|---|---|\r\n| 最新一次當機 | 2026-11-15 05:16:02（Boomerang 時間） |\r\n'
+                '| 最新一次當機的版本 | `8.22.5626.0` |\r\n| 本票承接的版本 | `8.21.5508.0`（2 次） |\r\n')
+        self.assertEqual(m.version_info(body), dict(latest_crash_at='2026-11-15 05:16:02（Boomerang 時間）',
+                         latest_crash_version='8.22.5626.0', owned_versions='8.21.5508.0（2 次）'))
+        old = m.version_info('| 版本 | 8.21.5508.0 |\n| 錯誤 | `0xc0000005` |')
+        self.assertEqual((old['latest_crash_version'], old['owned_versions']), (None, '8.21.5508.0'))
+        empty = m.version_info('PropID: 1')
+        self.assertEqual(set(empty.values()), {None})
+
+    def test_version_is_shown_in_every_list_and_missing_is_explicit(self):
+        m = self.module()
+        base = dict(title='T', url='https://github.com/x/y/issues/1', created_at='2026-11-09T01:00:00Z',
+                    delivered_at='2026-11-08T00:00:00Z')
+        rows = [dict(base, number=1, status='Handled', ending='fixed', latest_crash_version='8.22.5626.0',
+                     latest_crash_at='2026-11-15 05:16:02', owned_versions='8.22.5626.0（1 次）'),
+                dict(base, number=2, status='Handling', owned_versions='8.21.5508.0'),
+                dict(base, number=3, status='Init')]
+        rendered = m.render(dict(captured_at='2026-11-10T08:00:00+08:00', source='test', warnings=[], rows=rows),
+                            'daily', '2026-11-09')
+        self.assertGreaterEqual(rendered.count('8.22.5626.0'), 2)
+        self.assertIn('最新當機 2026-11-15 05:16:02', rendered)
+        self.assertIn('承接版本，無最新當機資料', rendered)
+        self.assertIn('尚無版本資料', rendered)
 
 
 if __name__ == '__main__':
